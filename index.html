@@ -60,8 +60,100 @@
     var el = document.getElementById('os-status');
     if (el) el.textContent = t;
   }
+  // ---- لوحة التشخيص: قيم حية + سجل أخطاء + سجل رسائل الـ SDK ----
+  var diagLogLines = [];
+  var diagErrorLines = [];
+  function diagTime() {
+    try { return new Date().toLocaleTimeString('en-GB'); } catch (e) { return String(new Date()); }
+  }
+  function diagSet(id, txt) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = txt;
+  }
+  function diagErrText(e) {
+    if (!e) return 'Unknown error';
+    var t = '';
+    try { t = e.stack ? String(e.stack) : ''; } catch (x) {}
+    if (!t) t = e.message ? String(e.message) : String(e);
+    return t;
+  }
+  function osDiagLogError(source, e) {
+    var line = '[' + diagTime() + '] ' + source + ': ' + diagErrText(e);
+    diagErrorLines.push(line);
+    var box = document.getElementById('diag-errors');
+    if (box) { box.textContent = diagErrorLines.join('\n'); box.scrollTop = box.scrollHeight; }
+  }
+  function osDiagAddLog(level, text) {
+    diagLogLines.push('[' + diagTime() + '] [' + level + '] ' + text);
+    while (diagLogLines.length > 30) diagLogLines.shift();
+    var box = document.getElementById('diag-log');
+    if (box) { box.textContent = diagLogLines.join('\n'); box.scrollTop = box.scrollHeight; }
+  }
+  function osDiagClearLog() {
+    diagLogLines = [];
+    diagErrorLines = [];
+    var logBox = document.getElementById('diag-log');
+    if (logBox) logBox.textContent = '';
+    var errBox = document.getElementById('diag-errors');
+    if (errBox) errBox.textContent = 'No errors yet.';
+  }
+  // اعتراض console.* قبل تهيئة الـ SDK: أي رسالة فيها OneSignal تُنسخ لسجل اللوحة.
+  (function () {
+    var levels = ['log', 'warn', 'error', 'info'];
+    levels.forEach(function (level) {
+      var orig = console[level];
+      if (typeof orig !== 'function') return;
+      console[level] = function () {
+        var args = Array.prototype.slice.call(arguments);
+        try { orig.apply(console, args); } catch (x) {}
+        try {
+          var parts = [];
+          args.forEach(function (a) {
+            if (typeof a === 'string') parts.push(a);
+            else if (a && a.message) parts.push(String(a.message));
+            else {
+              try { parts.push(JSON.stringify(a)); } catch (y) { parts.push(String(a)); }
+            }
+          });
+          var text = parts.join(' ');
+          if (text.toLowerCase().indexOf('onesignal') >= 0) osDiagAddLog(level, text);
+        } catch (z) {}
+      };
+    });
+  })();
+  function osDiagRefresh() {
+    var perm = 'لا يوجد';
+    try { perm = (typeof Notification !== 'undefined' && Notification.permission) ? String(Notification.permission) : 'لا يوجد'; } catch (e) { perm = 'لا يوجد'; }
+    diagSet('diag-perm', perm);
+    var optedInTxt = 'لا يوجد';
+    var subIdTxt = 'لا يوجد';
+    var tokenTxt = 'لا يوجد';
+    var osIdTxt = 'لا يوجد';
+    if (osApi && osApi.User) {
+      try {
+        var sub = osApi.User.PushSubscription;
+        if (sub) {
+          if (typeof sub.optedIn !== 'undefined' && sub.optedIn !== null) optedInTxt = String(sub.optedIn);
+          if (typeof sub.id === 'string' && sub.id) subIdTxt = sub.id;
+          if (typeof sub.token === 'string' && sub.token) tokenTxt = sub.token.slice(0, 24);
+        }
+      } catch (e) { osDiagLogError('PushSubscription read', e); }
+      try {
+        var oid = osApi.User.onesignalId;
+        if (typeof oid === 'string' && oid) osIdTxt = oid;
+      } catch (e) { osDiagLogError('onesignalId read', e); }
+    }
+    diagSet('diag-optedin', optedInTxt);
+    diagSet('diag-subid', subIdTxt);
+    diagSet('diag-token', tokenTxt);
+    diagSet('diag-osid', osIdTxt);
+    var logBox = document.getElementById('diag-log');
+    if (logBox && diagLogLines.length) logBox.textContent = diagLogLines.join('\n');
+    var errBox = document.getElementById('diag-errors');
+    if (errBox && diagErrorLines.length) errBox.textContent = diagErrorLines.join('\n');
+  }
   function osRefresh() {
-    if (!osApi) return;
+    if (!osApi) { osDiagRefresh(); return; }
     var sub = osApi.User.PushSubscription;
     var bSub = document.getElementById('os-sub');
     var bUn = document.getElementById('os-unsub');
@@ -81,41 +173,77 @@
       if (bSub) bSub.disabled = false;
       if (bUn) bUn.disabled = true;
     }
+    osDiagRefresh();
   }
+  // إعادة قراءة قيم التشخيص تلقائياً بعد 5 و15 ثانية من فتح الصفحة.
+  setTimeout(function () { osDiagRefresh(); if (osApi) osRefresh(); }, 5000);
+  setTimeout(function () { osDiagRefresh(); if (osApi) osRefresh(); }, 15000);
   if (OS_APP_ID.length >= 30) {
     OneSignalDeferred.push(async function (OneSignal) {
       osApi = OneSignal;
       try {
+        try {
+          if (OneSignal.Debug && typeof OneSignal.Debug.setLogLevel === 'function') {
+            OneSignal.Debug.setLogLevel('trace');
+          }
+        } catch (dbgErr) { osDiagLogError('Debug.setLogLevel', dbgErr); }
         await OneSignal.init({
           appId: OS_APP_ID
         });
-        OneSignal.User.PushSubscription.addEventListener('change', osRefresh);
+        OneSignal.User.PushSubscription.addEventListener('change', function () { osRefresh(); osDiagRefresh(); });
         osRefresh();
+        osDiagRefresh();
       } catch (e) {
+        osDiagLogError('init', e);
+        osDiagRefresh();
         osSetStatus('تعذرت تهيئة OneSignal: ' + (e && e.message ? e.message : String(e)) + ' — تأكد أن ملف OneSignalSDKWorker.js موجود في جذر المستودع بجانب هذه الصفحة، وأن منصة Web مفعلة في OneSignal.');
       }
     });
   }
   function osSubscribe() {
-    if (!osApi) { osSetStatus('ما زالت مكتبة OneSignal تُحمَّل — انتظر ثواني ثم حاول مرة أخرى.'); return; }
-    osApi.Notifications.requestPermission().then(function (granted) {
-      if (!granted) {
-        osSetStatus('لم يتم منح إذن الإشعارات — فعّله من إعدادات المتصفح لهذا الموقع ثم حاول مرة أخرى.');
-        return undefined;
-      }
-      return osApi.User.PushSubscription.optIn();
-    }).then(function () {
-      osRefresh();
-      // رقم الاشتراك قد يصل من الخادم بعد لحظات من الموافقة المحلية.
-      setTimeout(osRefresh, 2000);
-      setTimeout(osRefresh, 5000);
-    }).catch(function (e) {
+    if (!osApi) { osSetStatus('ما زالت مكتبة OneSignal تُحمَّل — انتظر ثواني ثم حاول مرة أخرى.'); osDiagRefresh(); return; }
+    try {
+      osApi.Notifications.requestPermission().then(function (granted) {
+        osDiagRefresh();
+        if (!granted) {
+          osSetStatus('لم يتم منح إذن الإشعارات — فعّله من إعدادات المتصفح لهذا الموقع ثم حاول مرة أخرى.');
+          osDiagRefresh();
+          return undefined;
+        }
+        try {
+          return osApi.User.PushSubscription.optIn();
+        } catch (e) {
+          osDiagLogError('optIn', e);
+          throw e;
+        }
+      }).then(function () {
+        osRefresh();
+        osDiagRefresh();
+        // رقم الاشتراك قد يصل من الخادم بعد لحظات من الموافقة المحلية.
+        setTimeout(osRefresh, 2000);
+        setTimeout(osRefresh, 5000);
+        setTimeout(osDiagRefresh, 2000);
+        setTimeout(osDiagRefresh, 5000);
+      }).catch(function (e) {
+        osDiagLogError('optIn/subscribe', e);
+        osDiagRefresh();
+        osSetStatus('تعذر الاشتراك: ' + (e && e.message ? e.message : String(e)));
+      });
+    } catch (e) {
+      osDiagLogError('optIn/subscribe', e);
+      osDiagRefresh();
       osSetStatus('تعذر الاشتراك: ' + (e && e.message ? e.message : String(e)));
-    });
+    }
   }
   function osUnsubscribe() {
-    if (!osApi) return;
-    osApi.User.PushSubscription.optOut().then(function () { osRefresh(); }).catch(function () { osRefresh(); });
+    if (!osApi) { osDiagRefresh(); return; }
+    try {
+      osApi.User.PushSubscription.optOut().then(function () { osRefresh(); osDiagRefresh(); }).catch(function (e) { osDiagLogError('optOut', e); osRefresh(); osDiagRefresh(); });
+    } catch (e) {
+      osDiagLogError('optOut', e);
+      osRefresh();
+      osDiagRefresh();
+    }
   }
 </script>
 </head>
@@ -147,6 +275,23 @@
     <div class="row">
       <button type="button" id="os-sub" onclick="osSubscribe()" disabled>اشترك من هذا الجهاز</button>
       <button type="button" id="os-unsub" class="ghost" onclick="osUnsubscribe()" disabled>إلغاء الاشتراك</button>
+    </div>
+    <div id="os-diag" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:.8rem">
+      <h3 style="margin:0 0 .5rem">لوحة تشخيص OneSignal</h3>
+      <div class="small" style="line-height:2">
+        <div>إذن الإشعارات Notification.permission: <span id="diag-perm" dir="ltr" class="tnum strong">—</span></div>
+        <div>PushSubscription.optedIn: <span id="diag-optedin" dir="ltr" class="tnum strong">لا يوجد</span></div>
+        <div>PushSubscription.id: <span id="diag-subid" dir="ltr" class="tnum" style="word-break:break-all">لا يوجد</span></div>
+        <div>PushSubscription.token (أول 24 حرفاً): <span id="diag-token" dir="ltr" class="tnum" style="word-break:break-all">لا يوجد</span></div>
+        <div>OneSignal.User.onesignalId: <span id="diag-osid" dir="ltr" class="tnum" style="word-break:break-all">لا يوجد</span></div>
+      </div>
+      <h3 style="margin:.9rem 0 .35rem;font-size:.9rem">سجل الأخطاء</h3>
+      <div id="diag-errors" dir="ltr" style="font-family:monospace;font-size:.72rem;line-height:1.5;text-align:left;white-space:pre-wrap;word-break:break-word;max-height:10rem;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:.5rem;background:var(--bg)">No errors yet.</div>
+      <div class="row" style="margin-top:.9rem;align-items:center;justify-content:space-between">
+        <h3 style="margin:0;font-size:.9rem">سجل SDK — رسائل OneSignal</h3>
+        <button type="button" id="diag-clear" class="ghost" onclick="osDiagClearLog()">مسح السجل</button>
+      </div>
+      <div id="diag-log" dir="ltr" style="font-family:monospace;font-size:.72rem;line-height:1.5;text-align:left;white-space:pre-wrap;word-break:break-word;max-height:12rem;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:.5rem;background:var(--bg);margin-top:.4rem"></div>
     </div>
   </section>
 
