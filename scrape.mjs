@@ -11,6 +11,11 @@
 //    الأفراد والمؤسسات (تنبيه: عمود البيع يسبق عمود الشراء في
 //    ترتيب أعمدة الصفحة).
 // 4) يرسل الصف JSON إلى تطبيق الويب المستقبِل في الشيت.
+//
+// تنبيه: صفحة البورصة تعيد تحميل نفسها بعد الفتح الأول أحياناً،
+// فكل خطوات القراءة هنا مبنية على انتظار الاستقرار وإعادة
+// المحاولة عند خطأ «Execution context was destroyed» بدل أن
+// تنهار التشغيلة من أول تنقّل.
 
 import { chromium } from 'playwright';
 import { writeFile } from 'node:fs/promises';
@@ -58,6 +63,95 @@ async function saveDebugAndExit(page, err) {
   process.exit(1);
 }
 
+// صفحة البورصة تعيد تحميل/توجيه نفسها بعد الفتح الأول أحياناً،
+// فيُدمَّر سياق التنفيذ ويرمي Playwright خطأ
+// «Execution context was destroyed». الدوال التالية تجعل كل خطوة
+// قراءة تتحمل هذا التنقّل وتعيد المحاولة حتى تستقر الصفحة، بدل
+// أن تنهار التشغيلة كلها من أول تنقّل.
+function isNavError(err) {
+  var m = err && err.message ? err.message : String(err || '');
+  return m.indexOf('Execution context was destroyed') >= 0 ||
+    m.toLowerCase().indexOf('navigation') >= 0;
+}
+
+// حلقة استقرار حتى 30 ثانية بعد فتح الصفحة: انتظار هدوء الشبكة
+// بمهلة متسامحة، ثم جسّ خفيف للصفحة (قراءة عنوانها)؛ إن رمى الجسّ
+// خطأ تدمير السياق نكرر الانتظار والمحاولة حتى تستقر الصفحة.
+async function waitForPageStable(page) {
+  var deadline = Date.now() + 30000;
+  var lastErr = null;
+  while (Date.now() < deadline) {
+    try {
+      await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(function () {});
+      await page.evaluate(function () { return document.title; });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!isNavError(err)) throw err;
+      console.log('الصفحة أعادت تحميل نفسها — انتظار الاستقرار…');
+      await page.waitForTimeout(1000);
+    }
+  }
+  throw lastErr || new Error('لم تستقر صفحة البورصة خلال 30 ثانية');
+}
+
+// انتظار ظهور جداول البيانات بمحاولات متكررة تتحمل تدمير السياق:
+// حتى 10 محاولات بفاصل ثانية، وتنجح المحاولة متى وُجدت «قيمة
+// الشراء» (بصورتها المطبّعة «قيمه الشراء») أو عنوانا الجدولين
+// في نص الصفحة.
+async function waitForTables(page) {
+  var lastErr = null;
+  for (var attempt = 1; attempt <= 10; attempt++) {
+    try {
+      var found = await page.evaluate(function () {
+        function norm(s) {
+          return (s || '')
+            .replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي')
+            .replace(/ة/g, 'ه').replace(/ؤ/g, 'و')
+            .replace(/\s+/g, ' ').trim();
+        }
+        var text = norm(document.body ? document.body.innerText : '');
+        if (text.indexOf('قيمه الشراء') >= 0) return true;
+        return text.indexOf('الافراد حسب الجنسيه') >= 0 &&
+          text.indexOf('الموسسات حسب الجنسيه') >= 0;
+      });
+      if (found) return;
+      lastErr = null;
+    } catch (err) {
+      lastErr = err;
+      if (!isNavError(err)) throw err;
+    }
+    if (attempt < 10) await page.waitForTimeout(1000);
+  }
+  if (lastErr) throw lastErr;
+  throw new Error('لم تظهر جداول البيانات في صفحة البورصة');
+}
+
+// الاستخراج مع إعادة المحاولة حتى 5 مرات: عند أي خطأ تنقّل ننتظر
+// اكتمال التحميل وثانيتين ثم نعيد الاستخراج من الصفر. ولا ينجح
+// الاستخراج إلا إذا أعاد فعلياً 12 رقماً مكتملة.
+async function extractWithRetry(page, extractFn) {
+  var lastErr = null;
+  for (var attempt = 1; attempt <= 5; attempt++) {
+    try {
+      var values = await extractFn();
+      var keys = Object.keys(values || {});
+      var complete = keys.length === 12 && keys.every(function (k) {
+        return typeof values[k] === 'number' && isFinite(values[k]);
+      });
+      if (!complete) throw new Error('الاستخراج لم يُرجع 12 رقماً مكتملة من جدولي البورصة');
+      return values;
+    } catch (err) {
+      lastErr = err;
+      if (!isNavError(err) || attempt === 5) throw err;
+      console.log('تدمّر سياق التنفيذ أثناء الاستخراج — إعادة المحاولة ' + (attempt + 1) + ' من 5…');
+      await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(function () {});
+      await page.waitForTimeout(2000);
+    }
+  }
+  throw lastErr || new Error('فشل استخراج القيم من صفحة البورصة');
+}
+
 async function main() {
   if (!WEBAPP_URL || !POST_TOKEN) {
     console.error('أسرار GitHub ناقصة: تأكد من وجود WEBAPP_URL و POST_TOKEN في إعدادات المستودع.');
@@ -88,7 +182,8 @@ async function main() {
 
   try {
     await page.goto(EGX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3000);
+    // الصفحة قد تعيد تحميل نفسها بعد الفتح الأول — ننتظر استقرارها
+    await waitForPageStable(page);
 
     // التحميل الأول قد يرجع صفحة بيضاء أحياناً — إعادة تحميل واحدة
     var bodyText = await page.evaluate(function () {
@@ -97,11 +192,21 @@ async function main() {
     if (!bodyText || bodyText.trim().length < 50) {
       console.log('الصفحة فارغة — إعادة التحميل مرة واحدة…');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(3000);
+      await waitForPageStable(page);
     }
 
-    // الضغط على راديو «الأسهم فقط» (يعيد تحميل الصفحة بنفس الرابط)
-    var clicked = await page.evaluate(function () {
+    await waitForTables(page);
+
+    // الضغط على راديو «الأسهم فقط» مقترناً بانتظار التنقّل الذي
+    // يسببه الضغط (يعيد تحميل الصفحة بنفس الرابط). انتظار التنقّل
+    // متسامح: إن حدث التنقّل أصلاً قبل الضغط، أو تدمّر السياق
+    // أثناء الضغط نفسه، نكمل ونعتمد على انتظار الاستقرار
+    // والجداول الذي يلي الضغط.
+    var clickOutcome = await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 })
+        .then(function () { return 'navigated'; })
+        .catch(function () { return 'no-navigation'; }),
+      page.evaluate(function () {
       function norm(s) {
         return (s || '')
           .replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي')
@@ -120,17 +225,57 @@ async function main() {
         if (lab && norm(lab.textContent) === 'الاسهم فقط') { r.click(); return true; }
       }
       return false;
-    });
-    if (!clicked) throw new Error('لم يتم العثور على اختيار «الأسهم فقط» في صفحة البورصة');
+      }).catch(function (err) {
+        if (isNavError(err)) return 'nav-during-click';
+        throw err;
+      })
+    ]);
+    if (clickOutcome[1] === false) throw new Error('لم يتم العثور على اختيار «الأسهم فقط» في صفحة البورصة');
 
-    await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(function () {});
-    await page.waitForTimeout(4000);
-    await page.waitForFunction(function () {
-      return document.querySelectorAll('table').length >= 3;
-    }, { timeout: 30000 });
+    await waitForPageStable(page);
+    await waitForTables(page);
 
-    // استخراج القيم من جدولي الأفراد والمؤسسات
-    var values = await page.evaluate(function () {
+    // إن تدمّر السياق أثناء الضغط نفسه فقد لا تكون الضغطة سُجّلت —
+    // تحقق أن «الأسهم فقط» مفعّل فعلاً، وكرر الضغط عند الحاجة.
+    var stocksChecked = await page.evaluate(function () {
+      function norm(s) {
+        return (s || '')
+          .replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي')
+          .replace(/ة/g, 'ه').replace(/ؤ/g, 'و')
+          .replace(/\s+/g, ' ').trim();
+      }
+      var labels = Array.prototype.slice.call(document.querySelectorAll('label'));
+      for (var i = 0; i < labels.length; i++) {
+        if (norm(labels[i].textContent) === 'الاسهم فقط') {
+          var input = labels[i].querySelector('input[type="radio"]');
+          if (!input && labels[i].htmlFor) input = document.getElementById(labels[i].htmlFor);
+          return input ? !!input.checked : true;
+        }
+      }
+      return true;
+    }).catch(function () { return true; });
+    if (!stocksChecked) {
+      await page.evaluate(function () {
+        function norm(s) {
+          return (s || '')
+            .replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي')
+            .replace(/ة/g, 'ه').replace(/ؤ/g, 'و')
+            .replace(/\s+/g, ' ').trim();
+        }
+        var labels = Array.prototype.slice.call(document.querySelectorAll('label'));
+        for (var i = 0; i < labels.length; i++) {
+          if (norm(labels[i].textContent) === 'الاسهم فقط') { labels[i].click(); return true; }
+        }
+        return false;
+      }).catch(function () { return false; });
+      await waitForPageStable(page);
+      await waitForTables(page);
+    }
+
+    // استخراج القيم من جدولي الأفراد والمؤسسات — ملفوفاً في إعادة
+    // محاولة تتحمل تدمير سياق التنفيذ، ولا ينجح إلا بـ 12 رقماً
+    var extractOnce = function () {
+      return page.evaluate(function () {
       function norm(s) {
         return (s || '')
           .replace(/[أإآ]/g, 'ا').replace(/ى/g, 'ي')
@@ -202,7 +347,9 @@ async function main() {
         fo_ind_buy: foI.buy, fo_ind_sell: foI.sell,
         fo_inst_buy: foS.buy, fo_inst_sell: foS.sell
       };
-    });
+      });
+    };
+    var values = await extractWithRetry(page, extractOnce);
 
     await browser.close();
     console.log('EGX values for ' + now.date + ' ' + slotTime + ': ' + JSON.stringify(values));
