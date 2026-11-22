@@ -16,6 +16,15 @@
 // فكل خطوات القراءة هنا مبنية على انتظار الاستقرار وإعادة
 // المحاولة عند خطأ «Execution context was destroyed» بدل أن
 // تنهار التشغيلة من أول تنقّل.
+//
+// النسخة الثالثة (التخفي والتشخيص): سياق متصفح بهوية واقعية
+// (كروم حديث على ويندوز، لغة ومنطقة زمنية مصرية، إخفاء بصمة
+// الأتمتة)، زيارة إحماء للصفحة الرئيسية قبل صفحة البيانات
+// لتلقّي كوكيز الحماية، وسطر تشخيصي «DIAG:» في السجل يطبع
+// عنوان الصفحة ورابطها وبداية نصها قبل أي فشل نهائي — لأن
+// تشغيلة GitHub Actions سابقة أظهرت أن الجداول لا تصل إلى
+// متصفحها أصلاً، والاشتباه أن حماية الموقع ترد على المتصفح
+// الآلي مكشوف الهوية أو عناوين مراكز البيانات بصفحة تحقق/حظر.
 
 import { chromium } from 'playwright';
 import { writeFile } from 'node:fs/promises';
@@ -54,7 +63,33 @@ function floorQuarter(mins) {
   return mins - (mins % 15);
 }
 
+// تشخيص ذاتي: يطبع في السجل سطراً يبدأ بـ «DIAG:» بما وصل
+// للمتصفح فعلاً — عنوان الصفحة الحالي ورابطها وأول 300 حرف
+// من نص جسمها المرئي — حتى يظهر في سجل GitHub إن كانت حماية
+// الموقع ردّت بصفحة حظر أو تحقق بدل صفحة البيانات. عند نجاح
+// الاستخراج يُطبع العنوان فقط، مرة واحدة قبل الإرسال.
+async function logDiag(page, titleOnly) {
+  try {
+    var info = await page.evaluate(function () {
+      return {
+        title: document.title || '',
+        url: location.href,
+        text: (document.body ? document.body.innerText : '')
+          .replace(/\s+/g, ' ').trim().slice(0, 300)
+      };
+    });
+    if (titleOnly) {
+      console.log('DIAG: title=' + info.title);
+    } else {
+      console.log('DIAG: title=' + info.title + ' | url=' + info.url + ' | text=' + info.text);
+    }
+  } catch (e) {
+    console.log('DIAG: تعذر قراءة حالة الصفحة (' + (e && e.message ? e.message : String(e)) + ')');
+  }
+}
+
 async function saveDebugAndExit(page, err) {
+  if (page) await logDiag(page, false);
   console.error('FAILED: ' + (err && err.message ? err.message : String(err)));
   if (page) {
     try { await page.screenshot({ path: 'egx-debug.png', fullPage: true }); } catch (e) {}
@@ -96,12 +131,13 @@ async function waitForPageStable(page) {
 }
 
 // انتظار ظهور جداول البيانات بمحاولات متكررة تتحمل تدمير السياق:
-// حتى 10 محاولات بفاصل ثانية، وتنجح المحاولة متى وُجدت «قيمة
+// حتى 15 محاولة بفاصل ثانية (مهلة أطول لاحتمال بطء صفحة تحقق
+// تسبق البيانات)، وتنجح المحاولة متى وُجدت «قيمة
 // الشراء» (بصورتها المطبّعة «قيمه الشراء») أو عنوانا الجدولين
 // في نص الصفحة.
 async function waitForTables(page) {
   var lastErr = null;
-  for (var attempt = 1; attempt <= 10; attempt++) {
+  for (var attempt = 1; attempt <= 15; attempt++) {
     try {
       var found = await page.evaluate(function () {
         function norm(s) {
@@ -121,7 +157,7 @@ async function waitForTables(page) {
       lastErr = err;
       if (!isNavError(err)) throw err;
     }
-    if (attempt < 10) await page.waitForTimeout(1000);
+    if (attempt < 15) await page.waitForTimeout(1000);
   }
   if (lastErr) throw lastErr;
   throw new Error('لم تظهر جداول البيانات في صفحة البورصة');
@@ -175,12 +211,32 @@ async function main() {
   }
   var slotTime = toHHMM(slotMinutes);
 
-  var browser = await chromium.launch();
-  var page = await browser.newPage({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  // سياق متصفح بهوية واقعية: حماية موقع البورصة تعامل المتصفح
+  // الآلي مكشوف الهوية بصفحة تحقق/حظر لا تصل للبيانات، فنخفي
+  // بصمات الأتمتة ونقدّم هوية كروم حديث على ويندوز بلغة
+  // ومنطقة زمنية مصريتين وأبعاد شاشة معتادة.
+  var browser = await chromium.launch({
+    args: ['--disable-blink-features=AutomationControlled', '--lang=ar-EG']
   });
+  var context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    locale: 'ar-EG',
+    timezoneId: 'Africa/Cairo',
+    viewport: { width: 1366, height: 768 }
+  });
+  await context.addInitScript(function () {
+    Object.defineProperty(navigator, 'webdriver', {
+      get: function () { return undefined; }
+    });
+  });
+  var page = await context.newPage();
 
   try {
+    // زيارة إحماء: الصفحة الرئيسية أولاً وانتظار استقرارها
+    // لتلقّي كوكيز الحماية، ثم الانتقال داخل نفس السياق إلى
+    // صفحة فئات المستثمرين.
+    await page.goto('https://www.egx.com.eg/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForPageStable(page);
     await page.goto(EGX_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     // الصفحة قد تعيد تحميل نفسها بعد الفتح الأول — ننتظر استقرارها
     await waitForPageStable(page);
@@ -350,6 +406,10 @@ async function main() {
       });
     };
     var values = await extractWithRetry(page, extractOnce);
+
+    // تشخيص النجاح: عنوان الصفحة التي قُرئت منها الأرقام،
+    // مرة واحدة قبل الإرسال
+    await logDiag(page, true);
 
     await browser.close();
     console.log('EGX values for ' + now.date + ' ' + slotTime + ': ' + JSON.stringify(values));
