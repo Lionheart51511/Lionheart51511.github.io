@@ -1,0 +1,54 @@
+name: EGX investor fetch
+
+on:
+  schedule:
+    # كل ربع ساعة من 07:00 إلى 12:59 بتوقيت UTC، أيام الأحد–الخميس
+    # (في cron الرقم 0 = الأحد و 4 = الخميس). هذا النطاق يغطي جلسة
+    # 10:00–14:30 بتوقيت القاهرة صيفاً وشتاءً، وسكربت scrape.mjs
+    # نفسه يتحقق من توقيت القاهرة بدقة قبل أن يجلب أي شيء.
+    - cron: '*/15 7-12 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'تجاوز حارس نافذة الجلسة — للاختبار اليدوي فقط'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright + Chromium
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Scrape EGX and write the row to the sheet
+        env:
+          WEBAPP_URL: ${{ secrets.WEBAPP_URL }}
+          POST_TOKEN: ${{ secrets.POST_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: node scrape.mjs
+
+      - name: Upload debug screenshot + HTML on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egx-debug
+          path: |
+            egx-debug.png
+            egx-debug.html
+          if-no-files-found: ignore
